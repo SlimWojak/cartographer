@@ -5,16 +5,19 @@ contract. Both should be read together.
 
 ## Source-of-authority documents (read first)
 
-| Document | Path | Why |
-| --- | --- | --- |
-| Concept board | `cartographer_concept_board.md` | The original idea + advisor framing. North star: "candidate-only, not truth engine." |
-| V0 mission brief | `CARTOGRAPHER_V0_MISSION_BRIEF.md` | What you're being asked to build. Hard rules and deliverables. |
-| en1gma orientation | `docs/source_methodology/root/CLAUDE.md` | What en1gma is. Cartographer must not interfere with it. |
-| HTF Map primer | `docs/source_methodology/canonical/MAP_SPATIAL_PRIMER_v1.md` | The HTF map concept in depth. Required reading to understand candidate types. |
-| Methodology index | `docs/source_methodology/methodology/METHODOLOGY_INDEX.md` | Map to the full methodology corpus. |
-| Olya methodology digest | `docs/source_methodology/reviews/PHASE_5_C2_OLYA_METHODOLOGY_DIGEST_2026_04_30.md` | Current state of the methodology conversation with Olya. |
-| WP2 strong-close-through gap report | `docs/source_methodology/reviews/PHASE_5_C2_WP2_DAILY_STRONG_CLOSE_THROUGH_PRIMITIVE_GAP_REPORT_2026_05_01.md` | Directly relevant to V0 heuristic #1. |
-| Calibration results | `docs/source_methodology/root/calibration_results.yaml` | 27 Olya answers — informs heuristic parameter defaults. |
+| # | Document | Path | Why |
+| - | --- | --- | --- |
+| 1 | **WP2 strong-close-through gap report** | `docs/source_methodology/reviews/PHASE_5_C2_WP2_DAILY_STRONG_CLOSE_THROUGH_PRIMITIVE_GAP_REPORT_2026_05_01.md` | **The open en1gma question cartographer V0 directly addresses.** Read before anything else. |
+| 2 | V0 mission brief | `CARTOGRAPHER_V0_MISSION_BRIEF.md` | What you're being asked to build. Hard rules and deliverables. |
+| 3 | Concept board | `cartographer_concept_board.md` | The original idea + advisor framing. North star: "candidate-only, not truth engine." |
+| 4 | en1gma orientation | `docs/source_methodology/root/CLAUDE.md` | What en1gma is — including the Phase 5 hard guardrail cartographer must respect. |
+| 5 | HTF Map primer | `docs/source_methodology/canonical/MAP_SPATIAL_PRIMER_v1.md` | The HTF map concept in depth. Required reading to understand candidate types. |
+| 6 | Methodology index | `docs/source_methodology/methodology/METHODOLOGY_INDEX.md` | Map to the full methodology corpus. |
+| 7 | Locked L1 primitives | `docs/source_methodology/methodology/SYNTHETIC_OLYA_METHOD_vLOCK.yaml` | Especially SWING_POINTS, FVG, MSS, DISPLACEMENT, REFERENCE_LEVELS sections. Cartographer ports these algorithms. |
+| 8 | HTF state detection | `docs/source_methodology/methodology/STATE_DETECTION_LOGIC_v2.yaml` | Phase classifier informing balance + trap-extreme heuristics. |
+| 9 | Olya methodology digest | `docs/source_methodology/reviews/PHASE_5_C2_OLYA_METHODOLOGY_DIGEST_2026_04_30.md` | Current state of the methodology conversation with Olya. |
+| 10 | Reference levels source (port target) | `en1gma-ref/en1gma/console/detection/ra_engine/detectors/reference_levels.py` | PDH/PDL/PWH/PWL/Equilibrium/Midnight Open. Port verbatim per brief §3.5. |
+| 11 | Calibration results | `docs/source_methodology/root/calibration_results.yaml` | 27 Olya answers — informs heuristic parameter defaults. |
 
 ## Data
 
