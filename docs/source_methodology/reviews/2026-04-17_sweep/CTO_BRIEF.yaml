@@ -1,0 +1,858 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# CTO KERNEL BRIEF — en1gma Trading Kernel
+# As-of: 2026-04-17
+# Audience: G (Sovereign Operator), CTO, advisors
+# Format: DENSE_M2M (CLAUDE.md §10)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+brief_metadata:
+  date: "2026-04-17"
+  kernel_version: "0.6"
+  repo: "github.com/SlimWojak/en1gma"
+  sources:
+    architecture: "CLAUDE.md (2026-03-31), docs/NORTH_STAR.md (2026-03-30)"
+    roadmap: "docs/FORWARD_PLAN.md (2026-03-31)"
+    defect_posture: "docs/SWEEP_FINDINGS_2026-04-17.yaml (authoritative)"
+    sentinel_provenance: "docs/superpowers/plans/2026-04-03-gemma-sentinel.md"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1. SYSTEM ARCHITECTURE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+architecture:
+
+  spine:
+    L1_DATA:
+      modules: [data/river.py, data/bar_types.py, data/tf_aggregator.py]
+      role: "River → raw 1m bars → canonicalization → TF aggregation"
+      live_source: "~/phoenix-river/EURUSD (parquet + staging JSONL)"
+
+    L2_DETECTION:
+      modules: [detection/detect.py, "detection/ra_engine/ (39 vendored files)"]
+      role: "Sole detection oracle — 13 vLOCK primitives, all TFs"
+      invariant: INV-DETECTION-AUTHORITY-SINGLETON
+      config: "detection/locked_baseline.yaml"
+
+    L3_CONTEXT:
+      modules:
+        - context/map_engine.py      # "composes regime + DR + PDA store"
+        - context/regime.py           # "direction + phase + authority TF"
+        - context/dealing_range.py    # "wick-to-wick, rolling cycle model"
+        - context/pda_store.py        # "5-state lifecycle: OPEN→TOUCHED→REJECTED|MITIGATED|INVALIDATED"
+        - context/map_persistence.py  # "JSON cross-session state"
+        - context/liquidity.py        # "STUB — NotImplementedError, awaiting Olya Q9-Q11"
+      role: "Persistent spatial worldview (the Map / slow clock)"
+      note: "ARS Path A BYPASSES this layer entirely (DEC-ARS-BYPASSES-MAP)"
+
+    L4_GATING_EXECUTION:
+      modules:
+        - gating/execution_gate.py    # "4-condition boolean gate"
+        - chain/chain_evaluator.py    # "sweep→MSS→FVG→OTE universal chain"
+        - chain/chain_config.py       # "strategy-level chain tuning"
+        - chain/ars/ars_canon.py      # "self-contained ARS v1.3 algorithm"
+        - execution/intent_builder.py # "TradeIntent from ARS or chain"
+        - control/orchestrator.py     # "Path A sequencing"
+        - control/map_orchestrator.py # "Path B sequencing"
+        - control/day_state.py        # "2-state FSM: PRE/POST_EXPANSION"
+      role: "Gate (boolean) → LTF chain or ARS canon → intent construction"
+
+    L5_GOVERNANCE:
+      modules:
+        - control/halt.py             # "<50ms kill switch"
+        - control/lease.py            # "bounded autonomy FSM"
+        - control/risk.py             # "max trades, drawdown, consecutive losses"
+        - control/governance.py       # "packaged halt+lease+risk gate"
+        - execution/broker_adapter.py # "paper broker, immediate fills"
+      role: "ALL capital actions pass through this layer"
+      invariants: [INV-HALT-1, INV-HALT-2, INV-HALT-OVERRIDES-ALL, INV-NO-UNGOVERNED-TRADES]
+
+  two_clock_model:
+    ref: "docs/NORTH_STAR.md §3"
+    slow_clock:
+      name: "The Map"
+      updates_on: "structural events only (daily MSS, FVG mitigated, regime change)"
+      persistence: "cross-session — objects live days/weeks"
+      answers: "WHERE should we watch, WHICH direction"
+    fast_clock:
+      name: "The Execution"
+      updates_on: "per-bar within kill zones"
+      persistence: "intraday — resets each session"
+      answers: "HOW do we enter, right now, at this location"
+    separation_rule: "Map never fires a trade. Execution never decides direction."
+
+  execution_paths:
+
+    path_a_ars:
+      route: "River → ars_canon.py → halt check → PaperBroker"
+      entry_point: "scripts/run_ars_session.py:run_live_session"
+      sequencer: "control/orchestrator.py:run_ars_session"
+      algorithm: "chain/ars/ars_canon.py:process_session"
+      map_required: false
+      governance_actual: "halt_signal.check() + check_halt_signal() — NO check_governance()"
+      status: LIVE_PAPER_ON_M3
+
+    path_b_map_gated:
+      route: "River → detect.py(HTF) → Map → DayState → detect.py(LTF) → Gate → Chain → Intent → Governance → Broker → PDA write-back → Trace"
+      entry_point: "control/map_orchestrator.py:run_map_replay"
+      map_required: true
+      governance_actual: "check_governance(halt) — lease=None, risk=None silently skipped"
+      status: OPERATIONAL_REPLAY_ONLY
+
+  observability:
+    decision_trace: "observe/decision_trace.py → JSONL per session"
+    map_timeline: "observe/map_timeline.py → JSONL structural events (11 types)"
+    chain_trace: "emitted by map_orchestrator → chain_trace.jsonl"
+    replay: "observe/replay.py — INV-REPLAY-DETERMINISM proven"
+    sentinel: "scripts/sentinel.py — Gemma-powered 5-min cron monitor"
+    henry: "scripts/henry_analyst.py — GLM-5.1 offline forensic analyst"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2. CHANGES SINCE 2026-03-31
+# ═══════════════════════════════════════════════════════════════════════════════
+
+changes_since_baseline:
+  baseline_date: "2026-03-31 (CLAUDE.md + FORWARD_PLAN.md last updated)"
+
+  sentinel_deployment:
+    date: "2026-04-03"
+    ref: "docs/superpowers/plans/2026-04-03-gemma-sentinel.md"
+    what: |
+      Gemma 4 26B-A4B-4bit always-on system monitor.
+      5 health checks: halt_signal, river_heartbeat, ibkr_gateway, ars_daemon, notification_file.
+      Direct Telegram alerts for critical failures (independent of COO session).
+      Gemma synthesized assessments every 30 min or on state change.
+      ARS notification relay: pending.jsonl → Telegram (SESSION_START, ASIA_COMPLETE, SETUP_FOUND, TRADE_PLACED, TRADE_RESOLVED, SESSION_END, HALT).
+    files:
+      - scripts/sentinel.py
+      - scripts/sentinel_config.yaml
+      - scripts/start_gemma_server.sh
+      - tests/unit/test_sentinel.py
+    tests_added: "~30 (sentinel checks, format, relay, cursor, state change)"
+
+  henry_analyst:
+    date: "~2026-04-08 to 2026-04-16"
+    ref: "scripts/henry_analyst.py"
+    what: |
+      GLM 5.1 (baa-ai/GLM-5.1-RAM-420GB-MLX) offline forensic analyst on M3 Ultra.
+      Methodology bundle system (vlock, ars, dmb, map, chain, daily, full).
+      Structured YAML findings with line-level citations.
+      Prompt cache reuse attempted but failed (MLX CacheList serialization issue).
+      Config locked: thinking=false, temp=0.2, kv_bits=8, ~14min per task.
+    status: OPERATIONAL
+
+  ars_session_date_bug_fix:
+    ref: "SWEEP_FINDINGS prior_ledger_status:FIXED_session_date_bug"
+    commit: "ea72990"
+    what: "Session date calculation fix in run_ars_session.py"
+    status: VERIFIED_FIXED
+
+  asia_complete_notification:
+    ref: "SWEEP_FINDINGS prior_ledger_status:FIXED_ASIA_COMPLETE_notification"
+    commit: "ea72990"
+    what: "ASIA_COMPLETE event now emitted with high/low/range_pips/valid/reason"
+    status: VERIFIED_FIXED
+
+  multi_model_sweep:
+    date: "2026-04-17"
+    ref: "docs/SWEEP_FINDINGS_2026-04-17.yaml"
+    what: |
+      Fresh-eyes audit by Claude Opus High + GPT-5.4 High.
+      ~55 files audited. 29 raw findings → 24 after dedup → 20 new.
+      3 CRITICAL, 6 HIGH, 10 MEDIUM, 5 LOW.
+      Prior BUG_LEDGER (2026-04-09): 8 open items confirmed still open, 2 verified fixed.
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3. OPERATIONAL STATUS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+operational_status:
+
+  ars_path_a:
+    mode: "LIVE shadow/paper on M3"
+    automation: "launchd scheduled 05:50 local (21:50 NY)"
+    first_session: "2026-03-30"
+    parity: "151/151 zero-divergence (INV-CANON-FIDELITY proven)"
+    parity_test: "tests/contract/test_ars_parity.py"
+    walk_forward: "+54.02R, 5yr (2021-03-28 to 2026-03-20)"
+    notifications: "pending.jsonl → Sentinel relay → Telegram"
+    known_production_risks:
+      - id: SW05
+        severity: HIGH
+        summary: "River burst bar drop — next_bar() skips bars on poll delay"
+        ref: "data/river.py:155-194"
+      - id: SW09
+        severity: HIGH
+        summary: "ARS restart state loss — no phase checkpoint persistence"
+        ref: "scripts/run_ars_session.py:94-157"
+
+  detection_oracle:
+    status: OPERATIONAL
+    parity: "5/5 contract parity vs research_accelerator"
+    parity_test: "tests/contract/test_detection_parity.py"
+    primitives: 13
+    config: "detection/locked_baseline.yaml"
+
+  map_engine:
+    status: OPERATIONAL_V1
+    calibration: "27/27 Olya questions locked (2026-03-29)"
+    scope: "Daily regime + daily/4H FVG only (INV-MAP-SCOPE-V1.1)"
+    persistence: "JSON cross-session (context/map_persistence.py)"
+    timeline: "JSONL event log (observe/map_timeline.py, 11 event types)"
+    trade_001_accuracy: "DR origin=1.18199 extreme=1.16454 (0.1 pip)"
+    known_defects:
+      - {id: SW01, severity: CRITICAL, summary: "PDA mitigation direction INVERTED"}
+      - {id: SW04, severity: HIGH, summary: "PDA direction/zone corruption from detector"}
+      - {id: SW06, severity: HIGH, summary: "Terminal PDAs lost on persistence save"}
+      - {id: SW15, severity: LOW, summary: "PDA status enum string containment check"}
+
+  chain_evaluator:
+    status: OPERATIONAL
+    sequence: "sweep → MSS → FVG → OTE → entry"
+    ground_truth: "6/6 EXPANSION trades → COMPLETE with paper fills"
+    config_source: "strategies/daily_expansion.yaml via strategies/loader.py"
+    known_defects:
+      - {id: SW07, severity: HIGH, summary: "Timezone stripping instead of normalization"}
+      - {id: SW11, severity: MEDIUM, summary: "7 of 12 ChainConfig fields use hardcoded defaults"}
+      - {id: SW13, severity: MEDIUM, summary: "max_chain_bars=24 declared but never enforced"}
+      - {id: SW22, severity: LOW, summary: "OTE body vs wick source unverified"}
+
+  day_state_engine:
+    status: IMPLEMENTED_BUT_UNWIRED
+    design: "2-state FSM (PRE_EXPANSION / POST_EXPANSION)"
+    invariant: INV-DAY-STATE-MARKET-DRIVEN
+    unit_tests: "20 passing (tests/unit/test_day_state.py)"
+    wiring_defect:
+      id: SW03
+      severity: CRITICAL
+      summary: |
+        DayStateEngine.process_detections() is implemented and tested
+        but NEVER called from map_orchestrator.py. FSM never transitions.
+        DAILY_EXPANSION remains eligible for entire session regardless of market structure.
+      ref: "control/map_orchestrator.py (no call to process_detections anywhere)"
+
+  strategy_yaml:
+    status: OPERATIONAL
+    configs: ["strategies/daily_expansion.yaml (DAILY_EXPANSION v1.0)", "strategies/ars_v1_3.yaml"]
+    loader: "strategies/loader.py → StrategyParams + ChainConfig"
+    known_defects:
+      - {id: SW10, severity: MEDIUM, summary: "pda_timeframes loaded but never enforced in gate"}
+      - {id: SW17, severity: LOW, summary: "ARS YAML schema mismatch with loader"}
+
+  governance:
+    status: PARTIALLY_WIRED
+    design: "halt + lease + risk → GovernanceResult (control/governance.py)"
+    actual_path_a: "halt_signal.check() + check_halt_signal() directly — NO check_governance()"
+    actual_path_b: "check_governance(halt) — lease=None, risk=None silently skipped"
+    defect:
+      id: SW08
+      severity: HIGH
+      convergence: "BOTH models flagged independently — highest confidence finding"
+      summary: "Every trade path circumvents lease and risk checks"
+      invariant_violated: INV-NO-UNGOVERNED-TRADES
+
+  map_replay:
+    status: OPERATIONAL_BUT_CONTAMINATED
+    defect:
+      id: SW02
+      severity: CRITICAL
+      summary: |
+        run_map_replay() loads ALL bars through end_date, aggregates full range,
+        initializes MapEngine once from full dataset. LTF detections built once
+        per kill zone from full window. Forward-contaminated decisions in replay.
+        INVALIDATES walk-forward validation results.
+      ref: "control/map_orchestrator.py:128-162, 248-306"
+
+  tests:
+    count_as_of_docs: "142 passing (CLAUDE.md 2026-03-31)"
+    note: "Sentinel added ~30 tests post-baseline. Exact current count not verified from artifacts."
+    tiers:
+      unit: "tests/unit/ (day_state, orchestrator_m3, sentinel, ars_canon, chain_evaluator, etc.)"
+      contract: "tests/contract/ (ars_parity 151/151, detection_parity 5/5, map_trade001)"
+      scenario: "tests/scenario/ (map_wiring exit gates, smoke_live)"
+
+  sentinel:
+    status: OPERATIONAL
+    model: "Gemma 4 26B-A4B-4bit on M3 Ultra"
+    schedule: "cron every 5 min during session windows (18:00-08:00 NY, weekdays)"
+    checks: [halt_signal, river_heartbeat, ibkr_gateway, ars_daemon, notification_file]
+    relay: "ARS pending.jsonl → Telegram (7 event types)"
+    known_defects:
+      - {id: SW18, severity: MEDIUM, summary: "Config paths for river_heartbeat/notification_file ignored"}
+      - {id: SW19, severity: MEDIUM, summary: "Sunday 18:00+ market open treated as weekend for staleness"}
+      - {id: SW20, severity: MEDIUM, summary: "Gemma server script hardcodes /Users/a8ra_m3 venv path"}
+    operational_blocker: "crontab not installed — macOS sandbox prevents Claude Code from writing crontab"
+
+  henry:
+    status: OPERATIONAL
+    model: "GLM 5.1 (baa-ai/GLM-5.1-RAM-420GB-MLX) on M3 Ultra"
+    config: "thinking=false, temp=0.2, kv_bits=8"
+    bundles: [vlock, ars, dmb, map, chain, daily, full]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4. MULTI-MODEL SWEEP FINDINGS (2026-04-17)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+sweep_summary:
+  ref: "docs/SWEEP_FINDINGS_2026-04-17.yaml"
+  auditors: ["Claude Opus High (methodology fidelity)", "GPT-5.4 High (engineering robustness)"]
+  files_audited: "~55"
+  total_findings: 24
+  new_findings: 20
+  prior_ledger_overlaps: 4
+
+  critical_findings:
+
+    - id: SW01_PDA_MITIGATION_INVERTED
+      severity: CRITICAL
+      found_by: [opus]
+      affects: "Map-gated path — ALL bullish regime scenarios"
+      code_ref: "context/pda_store.py:118-125, context/map_engine.py:390-396"
+      summary: |
+        PDA mitigation direction is INVERTED. Code checks expansion-direction
+        penetration; correct ICT/vLOCK semantics require retrace-fills-through.
+        In bullish expansion, close > zone_top is trivially true → ALL touched
+        bullish FVGs immediately mitigate → zero active PDAs → gate never arms.
+      impact: "CAPITAL-CRITICAL for DAILY_EXPANSION in bullish regimes"
+      requires_olya: true
+
+    - id: SW02_MAP_REPLAY_FUTURE_LEAK
+      severity: CRITICAL
+      found_by: [codex]
+      affects: "Map-gated path — walk-forward validation integrity"
+      code_ref: "control/map_orchestrator.py:128-162, 248-306"
+      summary: |
+        run_map_replay() loads ALL bars through end_date, aggregates full range,
+        initializes MapEngine once. LTF detections built from full window.
+        Forward-contaminated decisions. INVALIDATES walk-forward results.
+      impact: "Overstated robustness in any walk-forward validation"
+      requires_olya: false
+
+    - id: SW03_DAY_STATE_NEVER_WIRED
+      severity: CRITICAL
+      found_by: [opus]
+      affects: "Map-gated path — DAILY_EXPANSION eligibility, future DAILY_CONTINUATION"
+      code_ref: "control/map_orchestrator.py (no call to process_detections)"
+      invariant_violated: INV-DAY-STATE-MARKET-DRIVEN
+      summary: |
+        DayStateEngine.process_detections() implemented and tested (18 call sites
+        in test_day_state.py) but NEVER called from map_orchestrator. FSM never
+        transitions PRE→POST during session. DAILY_EXPANSION remains eligible
+        for entire session. DAILY_CONTINUATION can never become eligible.
+      impact: "Market-driven day-state gate is dead code in production"
+      requires_olya: false
+
+  high_findings:
+
+    - id: SW04
+      summary: "PDA direction/zone corruption — detector FVG direction ignored, zones reconstructed"
+      code_ref: "context/map_engine.py:405-443"
+
+    - id: SW05
+      summary: "River burst bar drop — next_bar() skips bars on poll delay"
+      code_ref: "data/river.py:155-194"
+      affects: "BOTH paths — PRODUCTION ARS"
+
+    - id: SW06
+      summary: "Map persistence loses terminal PDAs — only active_pdas serialized"
+      code_ref: "context/map_persistence.py:45-114"
+
+    - id: SW07
+      summary: "Chain timezone stripping — replace(tzinfo=None) instead of UTC normalization"
+      code_ref: "chain/chain_evaluator.py:43-47"
+
+    - id: SW08
+      summary: "Governance lease/risk bypassed — both paths circumvent full check_governance()"
+      code_ref: "control/orchestrator.py:50-60, control/map_orchestrator.py:310, control/governance.py:35-76"
+      convergence: "BOTH models flagged independently"
+      invariant_violated: INV-NO-UNGOVERNED-TRADES
+
+    - id: SW09
+      summary: "ARS restart state loss — no phase checkpoint, loses Asia/sweep state on launchd restart"
+      code_ref: "scripts/run_ars_session.py:94-157, 167-255, 307-321"
+      affects: "PRODUCTION ARS"
+
+  prior_ledger_accounting:
+    total_prior_items: 10
+    verified_fixed: 2
+    confirmed_still_open: 8
+    items:
+      - {id: F1, status: OPEN, note: "subsumed by SW11 (min_rr is one of 7 unwired fields)"}
+      - {id: F2, status: OPEN, note: "re-confirmed by SW22 (OTE body vs wick)"}
+      - {id: F3, status: OPEN, note: "break_type fallback — not re-flagged, still valid"}
+      - {id: F4, status: OPEN, note: "subsumed by SW11 (mss_min_quality unwired)"}
+      - {id: F8, status: OPEN, note: "FVG mandatory ambiguity — awaits Olya ruling"}
+      - {id: F9, status: OPEN, note: "kill zone gate not enforced — covered by SW11"}
+      - {id: F10, status: OPEN, note: "missing OTE levels — 2 tracked vs 4 in vLOCK"}
+      - {id: F2b, status: OPEN, note: "FVG selection size-first vs confluence-first"}
+      - {id: FIXED_session_date_bug, status: VERIFIED_FIXED, commit: ea72990}
+      - {id: FIXED_ASIA_COMPLETE_notification, status: VERIFIED_FIXED, commit: ea72990}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5. SPRINT PRIORITIES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+sprint_priorities:
+
+  block_0_immediate:
+    label: "Fix before any further walk-forward or replay work"
+    effort: "1-2 days"
+    items:
+      - id: SW01
+        action: "Swap mitigation conditions in pda_store.py + map_engine.py + fix test"
+        blocker: "Requires Olya confirmation: mitigation = retrace fills through zone"
+      - id: SW02
+        action: "Re-initialize Map per trade date from [td-45d, td]; recompute LTF detections incrementally"
+        blocker: none
+      - id: SW03
+        action: "Add day_state_engine.process_detections(ltf_detections) call in map_orchestrator before gate eval"
+        blocker: none
+    rationale: |
+      SW02 invalidates walk-forward results. SW01 kills bullish scenarios.
+      SW03 violates INV-DAY-STATE-MARKET-DRIVEN. All three must resolve
+      before any further validation work has meaning.
+
+  block_1_before_dual_paper:
+    label: "Fix before running ARS + DAILY_EXPANSION simultaneously"
+    effort: "2-3 days"
+    items:
+      - {id: SW04, action: "Filter FVGs by direction, use detector zone_top/zone_bottom"}
+      - {id: SW05, action: "Queue-based next_bar() — AFFECTS PRODUCTION ARS"}
+      - {id: SW08, action: "Route both paths through check_governance(); wire lease+risk"}
+      - {id: SW09, action: "Persist ARS phase checkpoints; backfill on startup"}
+      - {id: SW10, action: "Enforce pda_timeframes filter from strategy YAML in gate"}
+      - {id: SW21, action: "Add scenario tests for 5 identified gaps"}
+
+  block_2_hardening:
+    label: "Fix before paper → live graduation"
+    effort: "2-3 days"
+    items:
+      - {id: SW06, action: "Persist full PDA store including terminal states"}
+      - {id: SW07, action: "Normalize all datetimes to UTC before comparison"}
+      - {id: SW11, action: "Complete YAML loading for all 12 ChainConfig fields + enforce"}
+      - {id: SW12, action: "Atomic map state writes (temp file + fsync + rename)"}
+      - {id: SW13, action: "Add temporal filter: reject sweeps older than max_chain_bars"}
+      - {id: SW14, action: "Emit structured warnings for malformed staging lines"}
+
+  block_3_cleanup:
+    label: "Fix when convenient"
+    effort: "1 day"
+    items: [SW15, SW16, SW17, SW18, SW19, SW20, SW22]
+
+  total_effort_estimate:
+    engineering: "6-9 days (Blocks 0-2) + 1 day (Block 3)"
+    olya_sessions: "2-3 sessions (10 items in queue)"
+    total: "~10-13 days to full hardening"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6. OLYA QUEUE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+olya_queue:
+  total_items: 10
+  priority_order:
+
+    - rank: 1
+      id: SW01
+      severity: CRITICAL
+      ask: "Confirm PDA mitigation = retrace fills through zone (not expansion passes through)"
+      context: "Bearish FVG mitigated when close > zone_top (price retraces UP through gap)"
+      blocks: "Block 0 — all bullish DAILY_EXPANSION scenarios"
+
+    - rank: 2
+      id: ARS_canon_v1_4
+      severity: refinement
+      ask: "Visual verification of 11 new trades on TradingView (body SL + 0.3pip buffer)"
+      context: "Backtest shows +83% total R, +12.7% win rate improvement"
+      blocks: "ARS v1.4 methodology evolution"
+
+    - rank: 3
+      id: SWEEP_direction_semantics
+      severity: documentation_ambiguity
+      ask: "Ruling on sweep direction convention + worked example for vLOCK"
+      context: "Bearish trade: chain uses OPPOSING sweep; Henry's ICT reading suggests SAME direction"
+      blocks: "Chain evaluator correctness for edge cases"
+
+    - rank: 4
+      id: F2
+      ask: "Confirm OTE body-to-body authoritative (not wick-to-wick)"
+      blocks: "SW22 resolution, chain evaluator OTE computation"
+
+    - rank: 5
+      id: F10
+      ask: "Confirm 0.50 as body equilibrium; approve 4-level OTE tracking"
+      blocks: "Chain evaluator completeness"
+
+    - rank: 6
+      id: F2b
+      ask: "Confirm FVG selection priority order (confluence-first vs size-first)"
+
+    - rank: 7
+      id: F4
+      ask: "Confirm minimum MSS quality grade (VALID or STRONG?)"
+
+    - rank: 8
+      id: F8
+      ask: "Ruling on FVG optional vs mandatory in chain"
+
+    - rank: 9
+      id: F9
+      ask: "Confirm kill zone as hard gate for entry signal"
+
+    - rank: 10
+      id: vLOCK_internal_inconsistencies
+      ask: "Authorize CTO to execute C1-C4 spec cleanup"
+      context: "4 internal inconsistencies in vLOCK (stale question, PENDING header, HTF wording, legacy BOS/CHoCH)"
+
+  can_resolve_without_olya:
+    - {id: U1, action: "Inspect detect.py MSS output fields for body vs wick — code inspection only"}
+    - {id: U2, action: "Inspect dealing_range.py equilibrium method — code inspection only"}
+    - {id: F1, action: "Add tp_r_multiplier field (subsumed by SW11)"}
+    - {id: F3, action: "Validate break_type against REVERSAL/CONTINUATION"}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 7. KEY RISKS AND ORDERING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+key_risks:
+
+  production_ars_silent_failures:
+    severity: HIGH
+    findings: [SW05, SW09]
+    description: |
+      Two independent silent failure modes in PRODUCTION ARS:
+      1. SW05: River burst bar drop after poll delay → missed sweeps/SL/TP hits
+      2. SW09: launchd restart loses Asia/sweep state → daemon appears healthy but doesn't trade
+    mitigation: "Block 1 fixes. SW05 is highest-urgency production fix."
+    ordering: "Fix SW05 BEFORE any further ARS observation conclusions"
+
+  map_gated_path_triple_critical:
+    severity: CRITICAL
+    findings: [SW01, SW02, SW03]
+    description: |
+      Three independent CRITICAL defects each independently undermine Map-gated path:
+      - SW01: kills bullish scenarios (zero active PDAs)
+      - SW02: invalidates walk-forward validation (future leak)
+      - SW03: day-state gate is dead code (invariant violation)
+      Combined effect: NO Map-gated validation result is trustworthy.
+    mitigation: "Block 0 — must resolve all three before M4 walk-forward"
+    ordering: "Fix Block 0 BEFORE resuming any walk-forward work"
+
+  governance_gap:
+    severity: HIGH
+    finding: SW08
+    description: |
+      Both execution paths bypass lease and risk checks.
+      Path A: manual halt check, no check_governance() call.
+      Path B: check_governance(halt) with lease=None, risk=None silently skipped.
+      INV-NO-UNGOVERNED-TRADES is violated on both paths.
+    mitigation: "Block 1. Safe for paper mode. MUST fix before live capital."
+    ordering: "Fix before dual_paper deployment"
+
+  walk_forward_invalidation:
+    severity: CRITICAL
+    finding: SW02
+    description: |
+      Any DAILY_EXPANSION walk-forward results produced through run_map_replay()
+      are forward-contaminated and cannot be trusted. M4 milestone (walk-forward
+      validation) cannot proceed until SW02 is resolved.
+    mitigation: |
+      Block 0 fix: per-date Map re-initialization from [td-45d, td] only.
+      LTF detections recomputed incrementally up to current bar, never to kz_end.
+      After fix, ALL prior walk-forward results must be re-run and re-validated.
+    ordering: "Fix SW02 BEFORE any M4 walk-forward work. Prior results are void."
+
+  ordering_risk_production_vs_map:
+    severity: HIGH
+    description: |
+      Production ARS (Path A) has two silent failure modes (SW05, SW09) that
+      could cause missed trades or flat sessions without any error signal.
+      Map-gated path (Path B) has three CRITICAL defects (SW01, SW02, SW03)
+      that invalidate all validation work.
+      
+      ORDERING CONFLICT: Block 0 (Map-gated criticals) and Block 1 (ARS
+      production fixes) compete for engineering time. SW05 (burst bar drop)
+      is the only finding that affects PRODUCTION capital path right now.
+    recommended_ordering: |
+      1. SW05 first (production ARS safety — 0.5 day)
+      2. SW01 + SW02 + SW03 together (Block 0 — 1-2 days, requires Olya for SW01)
+      3. SW09 + SW08 (Block 1 remainder — 1-2 days)
+      Rationale: SW05 is the only finding that can cause silent data loss in
+      the LIVE production daemon tonight. Everything else is paper/replay only.
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8. FORWARD PLAN ALIGNMENT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+forward_plan_alignment:
+  ref: "docs/FORWARD_PLAN.md (2026-03-31)"
+  assessment_date: "2026-04-17"
+
+  status_corrections:
+    # Claims in FORWARD_PLAN.md that the sweep contradicts or qualifies
+
+    day_state_engine:
+      forward_plan_claim: "OPERATIONAL — 20 unit tests, INV-DAY-STATE-MARKET-DRIVEN"
+      actual_status: "IMPLEMENTED_BUT_UNWIRED"
+      finding: SW03
+      correction: |
+        DayStateEngine is tested in isolation but never called from map_orchestrator.
+        INV-DAY-STATE-MARKET-DRIVEN is violated in production. FORWARD_PLAN should
+        downgrade to "IMPLEMENTED — awaiting orchestrator wiring (SW03)."
+
+    governance:
+      forward_plan_claim: "halt + lease + risk → GovernanceResult (packaged module)"
+      actual_status: "HALT_ONLY — lease and risk silently bypassed on both paths"
+      finding: SW08
+      correction: |
+        check_governance() exists but is called with lease=None, risk=None on Path B
+        and not called at all on Path A. FORWARD_PLAN should note "halt-only in
+        practice — full governance wiring required before dual_paper."
+
+    path_b_wiring:
+      forward_plan_claim: "OPERATIONAL — full Map-gated path end-to-end, YAML-driven"
+      actual_status: "OPERATIONAL_BUT_CONTAMINATED"
+      findings: [SW01, SW02, SW03, SW04]
+      correction: |
+        Path B runs end-to-end but with inverted PDA mitigation (SW01),
+        forward-leaked replay (SW02), unwired day-state (SW03), and
+        corrupted PDA direction/zones (SW04). 6/6 ground truth results
+        are valid only because they use REJECTED PDAs (not MITIGATED).
+        Walk-forward results are VOID. FORWARD_PLAN should note
+        "OPERATIONAL for ground truth replay; walk-forward BLOCKED on Block 0."
+
+  milestone_impact:
+
+    M4_WALK_FORWARD:
+      forward_plan_target: "week 3 (from 2026-03-31)"
+      actual_status: BLOCKED
+      blockers: [SW01, SW02, SW03]
+      revised_target: "Block 0 complete + re-validation (~1-2 weeks from now)"
+      action: |
+        Cannot proceed until all three Block 0 criticals are resolved.
+        After fix, ALL walk-forward runs must be re-executed from scratch.
+        Prior results are forward-contaminated and must be discarded.
+
+    DUAL_STRATEGY_PAPER:
+      forward_plan_target: "weeks 4-8"
+      actual_status: BLOCKED
+      blockers: [SW05, SW08, SW09, "M4 completion"]
+      revised_target: "Block 0 + Block 1 complete + M4 re-validated"
+      action: |
+        Requires: (1) ARS production fixes (SW05, SW09), (2) governance
+        full wiring (SW08), (3) M4 walk-forward re-validated post-Block 0.
+        Cannot run two strategies simultaneously without governance convergence.
+
+    P1_ARS_LIVE_OBSERVATION:
+      forward_plan_target: "this week (from 2026-03-31)"
+      actual_status: IN_PROGRESS_WITH_CAVEATS
+      caveats: [SW05, SW09]
+      action: |
+        ARS observation continues but conclusions about "no setup found"
+        sessions may be unreliable due to SW05 (burst bar drop) and SW09
+        (restart state loss). Fix SW05 before drawing conclusions from
+        observation data. Add SW05 fix to P1 prerequisites.
+
+    P4_DISCOVERY_SCAN:
+      forward_plan_target: "this week (from 2026-03-31)"
+      actual_status: BLOCKED
+      blockers: [SW02]
+      action: |
+        Discovery scan uses run_map_replay() which is forward-contaminated.
+        Any scan results produced before SW02 fix are unreliable.
+        Defer until Block 0 complete.
+
+  new_milestones_to_insert:
+
+    M3_5_SWEEP_REMEDIATION:
+      insert_before: M4_WALK_FORWARD
+      what: "Block 0 + Block 1 fixes from sweep findings"
+      effort: "4-6 days engineering + 2-3 Olya sessions"
+      deliverables:
+        - "SW01: PDA mitigation direction corrected (requires Olya confirmation)"
+        - "SW02: Incremental per-date Map replay (no future leak)"
+        - "SW03: DayStateEngine.process_detections() wired in map_orchestrator"
+        - "SW05: Queue-based next_bar() in River (production ARS safety)"
+        - "SW08: Full governance wiring on both paths"
+        - "SW09: ARS phase checkpoint persistence"
+        - "SW04, SW10, SW21: PDA direction fix, TF filter, test gaps"
+      gate: |
+        All Block 0 + Block 1 items resolved. 142+ tests still passing.
+        No new regressions. Olya confirms SW01 mitigation semantics.
+
+    M4_WALK_FORWARD_REVISED:
+      replaces: M4_WALK_FORWARD
+      what: "Walk-forward validation of DAILY_EXPANSION (clean replay)"
+      prerequisite: M3_5_SWEEP_REMEDIATION
+      effort: "1-2 days (re-run + Olya validation)"
+      gate: "Positive expectancy on validation set with clean replay"
+
+  reprioritized_immediate_priorities:
+    # Replaces FORWARD_PLAN §2 "IMMEDIATE PRIORITIES"
+
+    P0_PRODUCTION_ARS_SAFETY:
+      what: "Fix SW05 (burst bar drop) — affects LIVE production daemon"
+      effort: "0.5 day"
+      owner: "Opus"
+      gate: "next_bar() returns all bars from burst; no silent drops"
+
+    P1_BLOCK_0_CRITICALS:
+      what: "Fix SW01 + SW02 + SW03 — unblocks all Map-gated work"
+      effort: "1-2 days (SW01 requires Olya session)"
+      owner: "Opus (code), Olya (SW01 confirmation)"
+      gate: "All three resolved, tests passing, no forward leak in replay"
+
+    P2_BLOCK_1_HARDENING:
+      what: "Fix SW04 + SW08 + SW09 + SW10 + SW21"
+      effort: "2-3 days"
+      owner: "Opus"
+      gate: "Full governance wired, ARS restart-safe, PDA direction clean"
+
+    P3_ARS_OBSERVATION:
+      what: "Continue ARS live observation (post-SW05 fix)"
+      status: "ONGOING — caveated until SW05 deployed"
+
+    P4_DISCOVERY_SCAN:
+      what: "DEFERRED until Block 0 complete"
+      was: "this week"
+      now: "after M3.5"
+
+  open_technical_items_update:
+    # Items from FORWARD_PLAN §5 that need status changes
+
+    new_items_from_sweep:
+      - {id: SW01, severity: CRITICAL, section: "CRITICAL"}
+      - {id: SW02, severity: CRITICAL, section: "CRITICAL"}
+      - {id: SW03, severity: CRITICAL, section: "CRITICAL"}
+      - {id: SW05, severity: HIGH, section: "HIGH — PRODUCTION"}
+      - {id: SW08, severity: HIGH, section: "HIGH"}
+      - {id: SW09, severity: HIGH, section: "HIGH — PRODUCTION"}
+
+    items_to_close:
+      - id: "dealing_range_extreme_delta"
+        status: "CLOSED (2026-03-30) — confirmed by sweep, no regression"
+      - id: "mss_daily_detection"
+        status: "CLOSED (2026-03-30) — confirmed by sweep, no regression"
+
+    items_to_update:
+      - id: "forex_day_timestamp"
+        status: "OPEN — subsumed by SW07 (chain timezone stripping)"
+      - id: "lease_enforcement"
+        status: "OPEN — subsumed by SW08 (governance bypass)"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BOTTOM LINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 9. CTO ORIENTATION — SPECIFIC ANSWERS
+# Added 2026-04-17 in response to CTO's 7 questions
+# ═════════════════════════════════════════════════════════════════════════���═════
+
+cto_orientation:
+
+  q1_tests_passing:
+    answer: "202 passing"
+    detail: |
+      Full suite run on M4 (dev machine) 2026-04-17: 202 passed in 124.70s.
+      Up from 142 at March 31 baseline. Growth: +60 tests (Sentinel ~30, Henry,
+      orchestrator M3 wiring, day_state, discovery scan, strategy loader).
+      Zero failures, zero skips. All tiers (unit + contract + scenario).
+
+  q2_what_shipped_since_march_31:
+    answer: "7 commits, 4 major features"
+    commits_since_baseline:
+      - {date: "2026-04-03", commit: ea72990, what: "ARS session date bug fix + ASIA_COMPLETE notifications"}
+      - {date: "2026-04-03", commit: 615e9b9, what: "Sentinel — Gemma-powered always-on system monitor"}
+      - {date: "2026-04-06", commit: cda389d, what: "Sentinel ARS notification relay to Telegram"}
+      - {date: "2026-04-08", commit: 39e5920, what: "Henry — offline analyst on GLM 5.1"}
+      - {date: "2026-04-08", commit: 680c45e, what: "Henry per-task methodology bundles (2.6-5x smaller prefill)"}
+      - {date: "2026-04-16", commit: 715cac8, what: "Henry KV cache quantization + prompt cache reuse"}
+      - {date: "2026-04-17", commit: c06e0de, what: "Revert broken prompt cache session/persistence code"}
+    provenance: "All added by COO (Claude Code on M3) via Telegram while G was travelling"
+
+  q3_pending_items_status:
+    olya_validation_queue: "10 items — see Section 6. Zero Olya input since break started."
+    lab_variants: |
+      ARS v1.4 variant: backtest complete (+83% total R, body SL + 0.3pip buffer).
+      11 new trades identified. BLOCKED on Olya visual verification on TradingView.
+      No other lab variants in progress.
+    map_gated_walk_forward: "BLOCKED — SW02 (future leak in replay) invalidates all prior results"
+
+  q4_bugs_regressions:
+    answer: "22 new findings, 0 regressions"
+    detail: |
+      Multi-model sweep (Opus + Codex 5.4) found 22 new issues: 3 CRITICAL, 6 HIGH,
+      10 MEDIUM, 5 LOW. All prior BUG_LEDGER items confirmed (8 open, 2 fixed).
+      Zero test regressions — 202/202 passing. No existing functionality broken.
+      All CRITICALs are in Map-gated path (not production ARS).
+      Two HIGH findings (SW05, SW09) affect production ARS (silent failures).
+
+  q5_docs_currency:
+    answer: "STALE — all 3 core docs are 17+ days behind"
+    detail:
+      CLAUDE_md:
+        last_updated: "2026-03-31 (commit 97d794e)"
+        days_stale: 17
+        what_is_missing: |
+          Sentinel and Henry not mentioned in architecture or current state.
+          Test count says 142, actual is 202. No sweep findings referenced.
+          Day-state listed as OPERATIONAL but is actually UNWIRED (SW03).
+          Governance listed as complete but is PARTIALLY_WIRED (SW08).
+      FORWARD_PLAN_md:
+        last_updated: "2026-03-31 (commit 6552b02)"
+        days_stale: 17
+        what_is_missing: |
+          No M3.5 sweep remediation milestone. M4 walk-forward listed as
+          "week 3" target but is BLOCKED on 3 CRITICALs. No Sentinel/Henry.
+          Status corrections needed per Section 8 (day_state, governance, path_b).
+      NORTH_STAR_md:
+        last_updated: "2026-03-30 (commit 0df4e62)"
+        days_stale: 18
+        what_is_missing: "Strategic vision is still accurate. No update needed."
+    recommendation: |
+      CLAUDE.md and FORWARD_PLAN.md should be updated as part of M3.5 remediation.
+      Update after Block 0 fixes land so the docs reflect corrected state.
+
+  q6_olya_input_during_break:
+    answer: "NONE"
+    detail: |
+      Last Olya session: 2026-03-29 (27/27 Map calibration questions resolved).
+      calibration_results.yaml: last modified 2026-03-30 (commit 0df4e62).
+      Zero Olya commits, reviews, or methodology changes since March 29.
+      10 items now queued for her input (see Section 6).
+      Most urgent: SW01 (PDA mitigation semantics) — blocks all bullish scenarios.
+
+  q7_operational_state:
+    answer: "ARS LIVE on M3 (shadow/paper), with caveats"
+    detail:
+      ars_daemon:
+        status: "LIVE shadow/paper on M3 Ultra via launchd"
+        first_session: "2026-03-30"
+        automation: "launchd fires at 05:50 local (21:50 NY)"
+        observation: |
+          Daemon has been running nightly. COO deployed fixes (date bug, ASIA_COMPLETE)
+          on 2026-04-03. Session traces are on M3, not visible from M4 (this machine).
+          No session summary available from this machine.
+        caveats:
+          - "SW05: burst bar drop may have caused missed bars (silent, undetectable from traces)"
+          - "SW09: any launchd restart during session loses state (silent, appears as flat session)"
+      sentinel:
+        status: "CODE COMPLETE but cron NOT installed on M3"
+        blocker: "macOS sandbox prevents Claude Code from writing crontab — needs G terminal access"
+        manual_runs: "COO has run manually, but no automatic monitoring"
+      discovery_scan:
+        status: "SCRIPT EXISTS but results NOT consumed"
+        detail: |
+          run_discovery_scan.py committed 2026-03-31. Trace files exist
+          (2026-03-17.jsonl, 2026-03-18.jsonl) but no evidence of systematic
+          scan execution or results feeding back into methodology validation.
+          Script is also affected by SW02 (future leak in replay).
+      river:
+        status: "PRESUMED RUNNING on M3 (parquet + staging pipeline)"
+        note: "Cannot verify from M4. River health depends on Sentinel (not yet cron-installed)."
+
+bottom_line: |
+  1. ARS Path A is LIVE but has two silent failure modes (SW05 bar drop, SW09 restart loss) — fix SW05 TODAY.
+  2. Map-gated Path B has three CRITICAL defects (SW01/SW02/SW03) that independently invalidate all walk-forward results — Block 0 before ANY M4 work.
+  3. Governance (INV-NO-UNGOVERNED-TRADES) is violated on BOTH paths — both models converged on SW08 — fix before dual_paper.
+  4. Insert milestone M3.5 (sweep remediation, ~6 days + Olya sessions) between M3 and M4; prior M4 timeline is void.

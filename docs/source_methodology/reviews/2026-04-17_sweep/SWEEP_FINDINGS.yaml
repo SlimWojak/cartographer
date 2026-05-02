@@ -1,0 +1,1010 @@
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MULTI-MODEL CODEBASE SWEEP — 2026-04-17
+# en1gma Trading Kernel — Fresh-Eyes Audit
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Auditors:  Claude Opus High (methodology fidelity) + GPT-5.4 High (engineering robustness)
+# Scope:     Full codebase — Part A (runtime-critical), Part B (supporting infrastructure)
+# Baseline:  BUG_LEDGER_2026-04-09 (F1–F10, 2 uncertainties, 2 already-fixed)
+# Produced:  RepoPrompt consolidation session, 2026-04-17
+#
+# KEY: Findings are deduplicated across models. When both models flagged the same
+# issue, it is listed ONCE with source attribution. Cross-refs to BUG_LEDGER noted.
+#
+# PRODUCTION NOTE: ARS Path A is LIVE (shadow/paper). All Part A findings affect
+# the Map-gated Path B UNLESS explicitly marked as affecting ARS.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+sweep_metadata:
+  date: "2026-04-17"
+  models:
+    opus: "Claude Opus High — methodology fidelity lens"
+    codex: "GPT-5.4 High — engineering robustness lens"
+  files_audited: "~55 (38 Opus deep-read + 40 Codex deep-read, overlapping)"
+  prior_ledger: "BUG_LEDGER_2026-04-09 (not in repo — referenced from Downloads)"
+  total_raw_findings: 29  # 14 Opus + 15 Codex
+  after_dedup: 24          # 5 cross-model overlaps merged
+  new_vs_prior_ledger: 20  # 4 findings overlap with existing bug ledger items
+  stats:
+    critical: 3
+    high: 6
+    medium: 10
+    low: 5
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PART A — RUNTIME-CRITICAL PATH
+# These findings affect the trade decision pipeline. Fix priority is highest.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+part_a_runtime_critical:
+
+  # ─── CRITICAL ──────────────────────────────────────────────────────────────
+
+  - id: SW01_PDA_MITIGATION_INVERTED
+    severity: CRITICAL
+    class: semantic_drift
+    found_by: [opus]
+    affects: Map-gated path (DAILY_EXPANSION, all future strategies)
+    spec_refs:
+      - "calibration_results.yaml:Q14 — 'body closes beyond far edge = MITIGATED'"
+      - "vLOCK:FVG:L1_state_machine — 'BOUNDARY_CLOSED: bar.close crosses opposite boundary'"
+    code_refs:
+      - "en1gma/context/pda_store.py:118-125"
+      - "en1gma/context/map_engine.py:390-396"
+      - "en1gma/tests/unit/test_map_engine.py:141-154 (test validates WRONG behavior)"
+    description: |
+      PDA mitigation direction is INVERTED for both bearish and bullish contexts.
+
+      Code says:
+        BEARISH direction → mitigated when close < zone_bottom
+        BULLISH direction → mitigated when close > zone_top
+
+      Correct per ICT / vLOCK:
+        BEARISH FVG → mitigated when close > zone_top (retrace FILLS gap from below)
+        BULLISH FVG → mitigated when close < zone_bottom (retrace FILLS gap from above)
+
+      The code checks expansion-direction penetration, but mitigation means the
+      imbalance was FILLED by price returning THROUGH the zone from the opposite side.
+
+      Latent because 6/6 ground truth trades use REJECTED (via trade write-back),
+      so the inverted mitigation never fires on PDAs that matter. But in bullish
+      expansion, close > zone_top is trivially true → ALL touched bullish FVGs
+      immediately mitigate → zero active PDAs → gate never arms.
+    impact: |
+      CAPITAL-CRITICAL for DAILY_EXPANSION going live in bullish regimes.
+      Kills the PDA pool during replay, preventing gate arming, blocking valid trades.
+    proposed_fix:
+      - "Swap conditions in pda_store.py and map_engine.py"
+      - "BEARISH → mitigated when close > zone_top"
+      - "BULLISH → mitigated when close < zone_bottom"
+      - "Fix test_pda_lifecycle_mitigation to validate correct behavior (see SW13)"
+    requires_olya_input: true  # confirm mitigation = retrace fills, not expansion passes
+    prior_ledger_ref: null  # NEW — not in BUG_LEDGER
+
+  - id: SW02_MAP_REPLAY_FUTURE_LEAK
+    severity: CRITICAL
+    class: state_corruption
+    found_by: [codex]
+    affects: Map-gated path (walk-forward validation, replay integrity)
+    code_refs:
+      - "en1gma/control/map_orchestrator.py:128-162"
+      - "en1gma/control/map_orchestrator.py:248-306"
+    description: |
+      run_map_replay() loads ALL bars through end_date, aggregates the full range,
+      and initializes MapEngine once from that full dataset. LTF detections are built
+      once per kill zone from the full window through kz_end_dt and reused on earlier bars.
+
+      A 02:05 NY bar can be evaluated using regime/PDA built from later dates.
+      A chain can complete using MSS/FVG that only appears at 02:40-02:55.
+    impact: |
+      Forward-contaminated decisions in replay → overstated robustness in walk-forward.
+      If replay logic is reused for live, creates impossible future-seeing trades.
+      INVALIDATES walk-forward validation results.
+    proposed_fix:
+      - "Re-initialize Map per trade date from [td-45d, td] only"
+      - "Recompute LTF detections incrementally up to current bar, never to kz end"
+    requires_olya_input: false
+    prior_ledger_ref: null  # NEW
+
+  - id: SW03_DAY_STATE_NEVER_WIRED
+    severity: CRITICAL
+    class: missing_enforcement
+    found_by: [opus]
+    affects: Map-gated path (DAILY_EXPANSION eligibility, future DAILY_CONTINUATION)
+    invariant_violated: INV-DAY-STATE-MARKET-DRIVEN
+    spec_refs:
+      - "CLAUDE.md:INV-DAY-STATE-MARKET-DRIVEN"
+      - "en1gma/control/day_state.py:116 — process_detections() defined but never called"
+    code_refs:
+      - "en1gma/control/map_orchestrator.py:1-490 (no call to process_detections)"
+    description: |
+      DayStateEngine.process_detections() is implemented and thoroughly tested
+      (18 call sites in test_day_state.py) but NEVER called from map_orchestrator.
+
+      The orchestrator creates DayStateEngine, calls reset(), is_eligible(),
+      apply_pending_transition() — but never feeds HTF detections into process_detections().
+      The FSM never transitions PRE_EXPANSION → POST_EXPANSION during a session.
+
+      DAILY_EXPANSION remains eligible for the entire session regardless of market structure.
+      Only governance max_trades_per_day=1 prevents multiple trades — a risk gate, not
+      a market-structure gate. INV-DAY-STATE-MARKET-DRIVEN is dead code.
+    impact: |
+      1. Market-driven day-state gate is non-functional in production
+      2. DAILY_CONTINUATION (requires POST_EXPANSION) can never become eligible
+      3. If max_trades_per_day is increased, DAILY_EXPANSION fires multiple times
+    proposed_fix:
+      - "In map_orchestrator.py, after HTF detection on LTF window bars:"
+      - "  day_state_engine.process_detections(ltf_detections)"
+      - "Place BEFORE gate evaluation / is_eligible() checks"
+    requires_olya_input: false
+    prior_ledger_ref: null  # NEW
+
+  # ─── HIGH ──────────────────────────────────────────────────────────────────
+
+  - id: SW04_PDA_DIRECTION_ZONE_CORRUPTION
+    severity: HIGH
+    class: state_corruption
+    found_by: [codex]
+    affects: Map-gated path
+    code_refs:
+      - "en1gma/context/map_engine.py:405-443"
+    description: |
+      _initialize_pdas_from_detections() ignores detected FVG direction and exact
+      zone fields. Every FVG gets direction_context=regime_dir, and zone boundaries
+      are reconstructed as fvg.price ± half_gap instead of detector-provided zone_top/zone_bottom.
+
+      Opposing-direction FVGs can be stamped as same-direction PDAs, classified into
+      wrong premium/discount zone, and arm the gate.
+    impact: |
+      False ARMED states from wrong-direction PDAs. Wrong zone boundaries shift
+      gate arming and chain matching thresholds.
+    proposed_fix:
+      - "Filter FVGs by allowed direction relative to regime"
+      - "Populate PDA zones from detector zone_top/zone_bottom with validation"
+    requires_olya_input: false
+    prior_ledger_ref: null  # NEW — Opus F3 (zone approximation) is a subset of this
+
+  - id: SW05_LIVE_BARS_DROPPED_ON_BURST
+    severity: HIGH
+    class: silent_failure
+    found_by: [codex]
+    affects: BOTH paths (ARS + Map-gated) — River is shared infrastructure
+    code_refs:
+      - "en1gma/data/river.py:155-194"
+    description: |
+      get_new_bars() advances _last_seen_utc to the newest bar, but next_bar()
+      returns only new[0]. If multiple bars arrive between polls (sleep/wake, IO stall),
+      later bars are acknowledged internally before the caller sees them.
+    impact: |
+      After poll delay, 2+ bars land at once → next_bar() returns first, permanently
+      skips the rest → missed sweeps, missed SL/TP hits, broken session state.
+      THIS AFFECTS PRODUCTION ARS.
+    proposed_fix:
+      - "Maintain internal queue of unread bars in next_bar()"
+      - "Stop mutating _last_seen_utc until all bars consumed by caller"
+    requires_olya_input: false
+    prior_ledger_ref: null  # NEW
+
+  - id: SW06_MAP_PERSISTENCE_LOSES_TERMINAL_PDAS
+    severity: HIGH
+    class: state_corruption
+    found_by: [codex]
+    affects: Map-gated path (cross-session persistence)
+    code_refs:
+      - "en1gma/context/map_persistence.py:45-114"
+      - "en1gma/context/map_persistence.py:115-147"
+    description: |
+      serialize_map_state() stores active_pdas only; all_pdas always emitted as empty.
+      Terminal PDA lifecycle state (REJECTED/MITIGATED/INVALIDATED) is discarded on save.
+      After restart, previously consumed PDAs disappear from state.
+    impact: |
+      System can re-arm areas already consumed. Potential duplicate trades against
+      stale structure after restart.
+    proposed_fix:
+      - "Persist full PDA store including terminal states and lifecycle timestamps"
+      - "Add restore path that reconstructs complete PDAStore"
+    requires_olya_input: false
+    prior_ledger_ref: null  # NEW
+
+  - id: SW07_CHAIN_TIMEZONE_STRIPPING
+    severity: HIGH
+    class: edge_case
+    found_by: [codex]
+    affects: Map-gated path (chain evaluator)
+    code_refs:
+      - "en1gma/chain/chain_evaluator.py:43-47 (_make_comparable)"
+      - "en1gma/chain/chain_evaluator.py:258-267, 292-301, 339-346"
+    description: |
+      _make_comparable() strips tzinfo with replace(tzinfo=None) instead of converting
+      to a common timezone. Sweep/MSS/FVG ordering depends on these comparisons.
+      If detections arrive in UTC while current_bar_time is NY-aware (or vice versa),
+      timestamps representing different instants can compare equal or inverted.
+    impact: |
+      Chain accepts future evidence or rejects valid evidence depending on timezone mix.
+      Particularly dangerous when River provides UTC bars and detection times are NY.
+    proposed_fix:
+      - "Normalize all datetimes to UTC before comparison"
+      - "Fail fast on naive datetimes unless caller supplies timezone policy"
+    requires_olya_input: false
+    prior_ledger_ref: null  # NEW
+
+  - id: SW08_GOVERNANCE_LEASE_RISK_BYPASSED
+    severity: HIGH
+    class: invariant_violation
+    found_by: [opus, codex]  # BOTH models flagged this independently
+    affects: BOTH paths (ARS uses no governance; Map uses halt-only)
+    invariant_violated: INV-NO-UNGOVERNED-TRADES
+    code_refs:
+      - "en1gma/control/orchestrator.py:50-60 (ARS: manual halt only, no check_governance)"
+      - "en1gma/control/map_orchestrator.py:310 (Map: check_governance(halt) — no lease/risk)"
+      - "en1gma/control/governance.py:35-76 (lease_machine and risk_state silently optional)"
+    description: |
+      TWO separate gaps, both models flagged:
+      1. ARS orchestrator checks halt directly, never calls check_governance() at all
+      2. Map orchestrator calls check_governance() but passes only halt — lease and risk
+         parameters default to None and are silently skipped
+
+      Governance module degrades silently to halt-only when lease/risk not provided.
+      No assertion prevents live deployment without full governance wiring.
+    impact: |
+      Trades execute without lease validation or risk limit checks. When moving to
+      live capital, revoked lease or exceeded risk limits would not block trades.
+    proposed_fix:
+      - "Route ARS through check_governance() (not manual halt checks)"
+      - "Wire LeaseStateMachine + RiskState through Map path"
+      - "Add mode parameter: in live mode, require lease/risk to be non-None"
+    requires_olya_input: false
+    prior_ledger_ref: null  # NEW — both models converged on this independently
+
+  - id: SW09_ARS_RESTART_STATE_LOSS
+    severity: HIGH
+    class: production_readiness
+    found_by: [codex]
+    affects: ARS Path A (PRODUCTION daemon)
+    code_refs:
+      - "en1gma/scripts/run_ars_session.py:94-157"
+      - "en1gma/scripts/run_ars_session.py:167-255"
+      - "en1gma/scripts/run_ars_session.py:307-321"
+    description: |
+      Live ARS daemon reconstructs Asia range and sweep state only from bars observed
+      after process start. If launchd restarts at 00:30 or 02:15 NY, session loses
+      already-collected Asia/sweep state. Can reject valid setup or miss trade entirely.
+    impact: |
+      "Flat but healthy-looking" production behavior after restart. Operator sees
+      no error — system simply doesn't trade because it can't reconstruct context.
+      THIS IS PRODUCTION ARS ON M3.
+    proposed_fix:
+      - "Persist phase state checkpoints"
+      - "On startup, backfill current-session bars from parquet/staging before resuming"
+    requires_olya_input: false
+    prior_ledger_ref: null  # NEW
+
+  # ─── MEDIUM ────────────────────────────────────────────────────────────────
+
+  - id: SW10_PDA_TIMEFRAME_FILTER_UNENFORCED
+    severity: MEDIUM
+    class: missing_enforcement
+    found_by: [opus]
+    affects: Map-gated path
+    invariant_violated: INV-MAP-SCOPE-V1.1
+    code_refs:
+      - "en1gma/gating/execution_gate.py:90-120 (no TF filter)"
+      - "en1gma/context/map_engine.py:334 (creates PDAs from 1D AND 4H)"
+      - "en1gma/strategies/loader.py:134 (loads pda_timeframes, never used)"
+    description: |
+      Strategy YAML declares pda.timeframes: [DAILY], enforcing INV-MAP-SCOPE-V1.1.
+      Loader reads this into StrategyParams. But neither execution gate nor map
+      orchestrator filters PDAs by timeframe. 4H FVGs enter the PDA pool and can
+      arm the gate, violating the DAILY-only declaration.
+    proposed_fix:
+      - "Filter candidate PDAs by strategy's declared pda_timeframes in gate evaluation"
+    requires_olya_input: false
+    prior_ledger_ref: null  # NEW
+
+  - id: SW11_CHAIN_CONFIG_PARTIALLY_LOADED
+    severity: MEDIUM
+    class: config_fragility
+    found_by: [opus, codex]  # BOTH flagged independently
+    code_refs:
+      - "en1gma/strategies/loader.py:162-172 (loads 5 of 12 ChainConfig fields)"
+      - "en1gma/chain/chain_config.py:31-48 (12 config fields)"
+      - "en1gma/chain/chain_evaluator.py:243-379 (some fields never enforced)"
+    description: |
+      Loader maps only 5 fields from YAML to ChainConfig. Seven fields silently use
+      hardcoded defaults: sweep_required, sweep_proximity_buffer_pips, sweep_lookback_hours,
+      mss_min_quality, fvg_min_size_pips, min_rr, max_chain_bars.
+      Some of these (max_chain_bars, sweep_lookback_hours) are also never enforced
+      in chain_evaluator even if they were loaded.
+    proposed_fix:
+      - "Add missing fields to YAML, load them in loader"
+      - "Enforce all config fields in chain_evaluator or remove unused fields"
+    requires_olya_input: false
+    prior_ledger_ref: "Overlaps with BUG_LEDGER F1 (min_rr coupling)"
+
+  - id: SW12_MAP_PERSISTENCE_NON_ATOMIC_WRITE
+    severity: MEDIUM
+    class: race_condition
+    found_by: [codex]
+    affects: Map-gated path (cross-session persistence)
+    code_refs:
+      - "en1gma/context/map_persistence.py:158-173"
+    description: |
+      save_map_state() writes JSON directly with path.write_text(), no temp file,
+      fsync, or rename. A crash or concurrent save/load can leave truncated JSON.
+    proposed_fix:
+      - "Write to temp file, fsync, then atomically rename"
+    requires_olya_input: false
+    prior_ledger_ref: null  # NEW
+
+  - id: SW13_MAX_CHAIN_BARS_UNENFORCED
+    severity: MEDIUM
+    class: missing_enforcement
+    found_by: [opus]
+    affects: Map-gated path
+    code_refs:
+      - "en1gma/chain/chain_config.py:48 (max_chain_bars=24)"
+      - "en1gma/chain/chain_evaluator.py:1-526 (never referenced)"
+    description: |
+      max_chain_bars=24 declared but never checked. A sweep detected 100+ bars
+      before current bar can anchor the chain. Stale sweeps from early in kill zone
+      connect with current MSS/FVG, producing entries from disconnected events.
+    proposed_fix:
+      - "Add temporal filter in _match_sweep: reject sweeps older than max_chain_bars"
+    requires_olya_input: false
+    prior_ledger_ref: null  # NEW
+
+  - id: SW14_RIVER_STAGING_SILENT_DROP
+    severity: MEDIUM
+    class: silent_failure
+    found_by: [codex]
+    affects: BOTH paths (River is shared infrastructure)
+    code_refs:
+      - "en1gma/data/river.py:97-125"
+    description: |
+      load_staging_bars() silently continues on JSON parse errors and OSError.
+      No metric, log, or alert when staging lines are malformed. Daemon keeps
+      running on incomplete market data with zero operator visibility.
+    proposed_fix:
+      - "Emit structured warnings/counters for malformed lines"
+      - "Fail closed or raise health signal when error threshold exceeded"
+    requires_olya_input: false
+    prior_ledger_ref: null  # NEW
+
+  # ─── LOW ───────────────────────────────────────────────────────────────────
+
+  - id: SW15_PDA_STATUS_ENUM_STRING_CONTAINMENT
+    severity: LOW
+    class: error_handling
+    found_by: [opus, codex]  # BOTH flagged independently
+    code_refs:
+      - "en1gma/context/map_engine.py:375 (pda.status in PDAStatus.MITIGATED)"
+    description: |
+      Uses string containment check instead of equality. Works by accident because
+      no PDAStatus value is a substring of "MITIGATED". Should use == or 'in PDA_TERMINAL_STATES'.
+    proposed_fix:
+      - "Replace with: pda.status in PDA_TERMINAL_STATES"
+    requires_olya_input: false
+    prior_ledger_ref: null  # NEW — both models converged
+
+  - id: SW16_ARS_ENTRY_CAP_OPEN_VS_CLOSE
+    severity: LOW
+    class: spec_drift
+    found_by: [opus]
+    affects: ARS Path A
+    code_refs:
+      - "en1gma/chain/ars/ars_canon.py:205"
+    spec_refs:
+      - "ARS_CANON_v1_3.md:§14 — 'if candle.close_time >= 03:00 AM NY'"
+    description: |
+      Code checks candle OPEN time (ny_open_time.hour >= 3) but Canon checks CLOSE time.
+      The 02:55 candle (closes at 03:00) would be allowed by code but rejected by Canon.
+      ARS has 151/151 parity so likely doesn't occur in validation set.
+    proposed_fix:
+      - "Change check to use close time"
+      - "Resolve Canon §12 vs §14 inconsistency (> vs >=)"
+    requires_olya_input: false
+    prior_ledger_ref: null  # NEW
+
+  - id: SW17_ARS_YAML_SCHEMA_MISMATCH
+    severity: LOW
+    class: config_mismatch
+    found_by: [opus]
+    code_refs:
+      - "en1gma/strategies/ars_v1_3.yaml:1-49"
+      - "en1gma/strategies/loader.py:63"
+    description: |
+      ARS YAML uses nested structure (strategy.name, strategy.version) rather than
+      flat structure the loader expects. Loading via load_strategy_by_name would raise
+      StrategyLoadError. Blocks unified strategy management and dual_paper mode.
+    proposed_fix:
+      - "Restructure to match loader schema, or add separate loader path"
+    requires_olya_input: false
+    prior_ledger_ref: null  # NEW
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PART B — SUPPORTING INFRASTRUCTURE
+# Findings in scripts, tests, observe, docs. Fix after Part A stabilized.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+part_b_supporting:
+
+  # ─── MEDIUM ────────────────────────────────────────────────────────────────
+
+  - id: SW18_SENTINEL_CONFIG_PATHS_IGNORED
+    severity: MEDIUM
+    class: config_fragility
+    found_by: [codex]
+    code_refs:
+      - "en1gma/scripts/sentinel.py:24-29, 52-65, 174-228"
+      - "en1gma/scripts/sentinel_config.yaml:9-20"
+    description: |
+      sentinel_config.yaml defines configurable paths for river_heartbeat and
+      notification_file. collect_checks() ignores those entries and uses hardcoded defaults.
+      Operator can change YAML believing Sentinel watches new paths — it doesn't.
+    proposed_fix:
+      - "Pass configured paths through collect_checks()"
+      - "Add config-load test asserting every declared key is consumed"
+    requires_olya_input: false
+    prior_ledger_ref: null  # NEW
+
+  - id: SW19_SENTINEL_SUNDAY_OPEN_BLINDSPOT
+    severity: MEDIUM
+    class: production_readiness
+    found_by: [codex]
+    code_refs:
+      - "en1gma/scripts/sentinel.py:104-121"
+      - "en1gma/scripts/sentinel.py:612-620"
+    description: |
+      check_river_heartbeat() treats all Sunday hours as weekend (weekday() >= 5),
+      but _is_session_window() considers Sunday after 18:00 NY as in-session.
+      On Sunday market open, Sentinel can report PASS on a stale river heartbeat.
+    proposed_fix:
+      - "Use shared market-calendar helper for both scheduling and freshness checks"
+    requires_olya_input: false
+    prior_ledger_ref: null  # NEW
+
+  - id: SW20_GEMMA_SERVER_HARDCODED_VENV
+    severity: MEDIUM
+    class: config_fragility
+    found_by: [codex]
+    code_refs:
+      - "en1gma/scripts/start_gemma_server.sh:6-23"
+    description: |
+      Hardcodes VENV="/Users/a8ra_m3/en1gma/.venv". Tied to one host layout.
+      On rebuilt machine or different user, Gemma startup fails silently.
+    proposed_fix:
+      - "Resolve venv relative to repo or $HOME, validate exists, print actionable error"
+    requires_olya_input: false
+    prior_ledger_ref: null  # NEW
+
+  - id: SW21_CRITICAL_RUNTIME_TEST_GAPS
+    severity: MEDIUM
+    class: test_gap
+    found_by: [codex, opus]  # Both identified test coverage issues
+    code_refs:
+      - "en1gma/tests/scenario/test_smoke_live.py:124-172"
+      - "en1gma/tests/unit/test_orchestrator_m3.py:1-81"
+      - "en1gma/control/map_orchestrator.py:100-374"
+    description: |
+      Missing test coverage for:
+      1. run_map_replay() end-to-end (no future leakage test)
+      2. next_bar() burst delivery (>1 bar per poll)
+      3. ARS daemon restart recovery (mid-Asia, mid-sweep)
+      4. Day state wiring in orchestrator (process_detections never called — no test catches it)
+      5. Mitigation test validates INVERTED behavior (see SW01)
+    proposed_fix:
+      - "Add scenario tests for all 5 gaps (see individual findings for specifics)"
+    requires_olya_input: false
+    prior_ledger_ref: null  # NEW — both models flagged overlapping test gaps
+
+  # ─── LOW ───────────────────────────────────────────────────────────────────
+
+  - id: SW22_OTE_BODY_VS_WICK_UNVERIFIED
+    severity: LOW
+    class: semantic_drift
+    found_by: [opus]
+    code_refs:
+      - "en1gma/chain/chain_evaluator.py:242-260, 310-325"
+    spec_refs:
+      - "vLOCK:OTE:ote_measurement — body extremes"
+      - "vLOCK:OTE:premium_discount — wick extremes"
+    description: |
+      OTE calculated from mss.origin_price / mss.extreme_price without verifying
+      whether detect.py emits body-based or wick-based values. vLOCK mandates
+      body-to-body for OTE, wick-to-wick for P/D midpoint.
+    proposed_fix:
+      - "Verify detect.py MSS output fields, extract body-specific values for OTE"
+    requires_olya_input: false
+    prior_ledger_ref: "BUG_LEDGER F2 (OTE body vs wick) — confirms same concern"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CROSS-REFERENCE: EXISTING BUG LEDGER STATUS
+# Items from BUG_LEDGER_2026-04-09 — confirmed, superseded, or still pending
+# ═══════════════════════════════════════════════════════════════════════════════
+
+prior_ledger_status:
+
+  - id: F1_TP_min_rr_coupling
+    ledger_severity: HIGH
+    sweep_status: CONFIRMED_STILL_OPEN
+    sweep_note: "SW11 (chain config partially loaded) subsumes this — min_rr is one of 7 unwired fields"
+
+  - id: F2_OTE_body_vs_wick
+    ledger_severity: HIGH
+    sweep_status: CONFIRMED_STILL_OPEN
+    sweep_note: "SW22 re-confirms. Opus verified the same concern from a different angle."
+
+  - id: F9_kill_zone_gate_not_enforced
+    ledger_severity: MEDIUM
+    sweep_status: CONFIRMED_STILL_OPEN
+    sweep_note: "Neither model re-flagged explicitly, but SW11 (config dead guards) covers the enforcement gap."
+
+  - id: F10_missing_OTE_levels
+    ledger_severity: MEDIUM
+    sweep_status: CONFIRMED_STILL_OPEN
+    sweep_note: "Not re-flagged. Still valid — 2 levels tracked vs 4 in vLOCK."
+
+  - id: F2b_FVG_selection_size_first
+    ledger_severity: MEDIUM
+    sweep_status: CONFIRMED_STILL_OPEN
+    sweep_note: "Not re-flagged. Still valid — size-first vs confluence-first."
+
+  - id: F8_FVG_mandatory_ambiguity
+    ledger_severity: MEDIUM
+    sweep_status: CONFIRMED_STILL_OPEN
+    sweep_note: "Awaits Olya ruling."
+
+  - id: F3_break_type_fallback
+    ledger_severity: LOW
+    sweep_status: CONFIRMED_STILL_OPEN
+    sweep_note: "Not re-flagged. Still valid."
+
+  - id: F4_MSS_quality_grade_filter_missing
+    ledger_severity: LOW
+    sweep_status: CONFIRMED_STILL_OPEN
+    sweep_note: "SW11 subsumes — mss_min_quality is one of 7 unwired config fields."
+
+  - id: FIXED_session_date_bug
+    sweep_status: VERIFIED_FIXED
+    sweep_note: "Commit ea72990. Confirmed deployed."
+
+  - id: FIXED_ASIA_COMPLETE_notification
+    sweep_status: VERIFIED_FIXED
+    sweep_note: "Commit ea72990. Confirmed deployed."
+
+  # ─── TIER 2: Methodology Refinements ────────────────────────────────────
+
+  - id: ARS_canon_v1_4_pending
+    ledger_severity: refinement
+    sweep_status: CONFIRMED_STILL_PENDING
+    sweep_note: |
+      Backtest shows +83% total R, +12.7% win rate with body SL + 0.3pip buffer.
+      11 new trades found (10W/1L). BLOCKED on Olya visual verification on TradingView.
+      No sweep finding overlaps — this is a methodology evolution, not a bug.
+      Implementation effort is small (2 constants + body extreme tracking) once Olya approves.
+
+  # ─── TIER 3: Spec Clarification Requests ────────────────────────────────
+
+  - id: SWEEP_direction_semantics
+    ledger_severity: documentation_ambiguity
+    sweep_status: CONFIRMED_STILL_PENDING
+    sweep_note: |
+      Bearish trade: does chain look for BEARISH sweep (buy-side taken) or BULLISH sweep (opposing)?
+      Chain uses OPPOSING direction. Henry's ICT reading suggests SAME direction.
+      Still awaits Olya ruling + worked example to add to vLOCK.
+
+  - id: vLOCK_internal_inconsistencies
+    ledger_severity: documentation_hygiene
+    sweep_status: CONFIRMED_STILL_PENDING
+    sweep_note: |
+      C1: stale question in top checklist vs body resolution on FVG gate
+      C2: PENDING_CALIBRATION header vs LTF_locked body text
+      C3: HTF wording — does HTF inherit LTF MSS logic or have specialized settings?
+      C4: legacy BOS/CHoCH terminology in research contexts vs canonical MSS + break_type
+      All 4 items valid. Awaits Olya authorization for CTO to execute cleanup.
+
+  # ─── TIER 4: Uncertainty Items ──────────────────────────────────────────
+
+  - id: U1_MSSMatch_body_vs_wick_semantics
+    ledger_severity: uncertainty
+    sweep_status: CONFIRMED_STILL_OPEN
+    sweep_note: |
+      SW22 (OTE body/wick unverified) directly addresses this same concern.
+      Opus confirmed: MSSMatch.origin_price and extreme_price source is unknown —
+      must inspect detect.py MSS output to confirm body vs wick fields.
+      Resolution: inspect ra_engine/detectors/mss.py, document in MSSMatch dataclass.
+
+  - id: U2_DealingRange_equilibrium_method
+    ledger_severity: uncertainty
+    sweep_status: CONFIRMED_STILL_OPEN
+    sweep_note: |
+      Opus read dealing_range.py but did not flag the equilibrium method specifically.
+      Still needs verification: is equilibrium computed as body-to-body midpoint
+      (OTE 0.50 per vLOCK) or wick-to-wick (P/D midpoint per vLOCK)?
+      Correctness of Q8 chain check depends on this being wick-to-wick.
+
+  - id: U3_ChainConfig_ote_zone_default
+    ledger_severity: uncertainty
+    sweep_status: RESOLVED_IN_PRIOR_LEDGER
+    sweep_note: "Verified in BUG_LEDGER — chain_config.py:42 has (0.618, 0.79). See F10 for fix."
+
+  # ─── Operational Items (not bugs) ───────────────────────────────────────
+
+  - id: SENTINEL_cron_not_installed
+    ledger_severity: operational_blocker
+    sweep_status: CONFIRMED_STILL_BLOCKED
+    sweep_note: |
+      macOS sandbox prevents Claude Code from writing crontab. Needs G to run at M3 terminal:
+        crontab /tmp/crontab_backup.txt
+      OR: (crontab -l; cat /Users/a8ra_m3/en1gma/scripts/sentinel_cron.txt) | crontab -
+      Codex also found related issues: SW18 (config paths ignored) and SW19 (Sunday blindspot).
+
+  - id: HENRY_v2_config_locked_in
+    ledger_severity: operational_info
+    sweep_status: ACKNOWLEDGED
+    sweep_note: |
+      Henry config is production-ready: GLM-5.1, thinking=false, temp=0.2, ~14min per task.
+      No bugs found in henry_analyst.py by either model. Config is stable.
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SPRINT PRIORITY MATRIX
+# Recommended ordering for the forthcoming sprint
+# ═══════════════════════════════════════════════════════════════════════════════
+
+sprint_priorities:
+
+  block_0_immediate:
+    label: "Fix before any further walk-forward or replay work"
+    effort: "1-2 days"
+    items:
+      - SW01: "PDA mitigation inversion — confirm with Olya, fix pda_store + map_engine + test"
+      - SW02: "Map replay future leak — per-bar incremental replay, not full-window"
+      - SW03: "Day state wiring — call process_detections() in map_orchestrator"
+    rationale: |
+      SW02 invalidates walk-forward results. SW01 kills bullish scenarios.
+      SW03 violates a declared invariant. All three must be resolved before
+      any further validation work has meaning.
+
+  block_1_before_dual_paper:
+    label: "Fix before running ARS + DAILY_EXPANSION simultaneously"
+    effort: "2-3 days"
+    items:
+      - SW04: "PDA direction/zone corruption — filter by direction, use detector zones"
+      - SW05: "River burst bar dropping — queue-based next_bar() (AFFECTS PRODUCTION ARS)"
+      - SW08: "Governance full wiring — route both paths through check_governance()"
+      - SW09: "ARS restart recovery — persist phase checkpoints"
+      - SW10: "PDA timeframe filter — enforce DAILY-only from strategy YAML"
+      - SW21: "Test gaps — add scenario tests for the 5 identified gaps"
+    rationale: |
+      SW05 and SW09 affect PRODUCTION ARS. SW08 is an invariant violation.
+      The rest are required for Map-gated path correctness.
+
+  block_2_hardening:
+    label: "Fix before paper → live graduation"
+    effort: "2-3 days"
+    items:
+      - SW06: "Map persistence — persist terminal PDAs"
+      - SW07: "Chain timezone normalization"
+      - SW11: "Chain config — complete YAML loading + enforcement"
+      - SW12: "Atomic map state writes"
+      - SW13: "Max chain bars enforcement"
+      - SW14: "River staging error visibility"
+    rationale: |
+      These are the production hardening items. None cause wrong trades today,
+      but all create fragility that will surface under live capital conditions.
+
+  block_3_cleanup:
+    label: "Fix when convenient"
+    effort: "1 day"
+    items:
+      - SW15: "PDA enum string containment fix"
+      - SW16: "ARS entry cap open vs close"
+      - SW17: "ARS YAML schema alignment"
+      - SW18: "Sentinel config path wiring"
+      - SW19: "Sentinel Sunday open blindspot"
+      - SW20: "Gemma server hardcoded venv"
+      - SW22: "OTE body/wick verification"
+    rationale: |
+      Low-impact items. Important for long-term code health but not blocking.
+
+  existing_ledger_still_pending:
+    label: "From BUG_LEDGER — items requiring action"
+
+    can_fix_without_olya:
+      - F1: "TP/min_rr coupling — add tp_r_multiplier field (subsumed by SW11)"
+      - F3: "break_type fallback — validate against REVERSAL/CONTINUATION"
+
+    awaiting_olya_input:
+      - SW01: "PDA mitigation inversion — confirm retrace-fills semantics (NEW from sweep)"
+      - F2: "OTE body vs wick — confirm body-to-body authoritative"
+      - F9: "Kill zone gate — confirm hard gate for entry signal"
+      - F10: "Missing OTE levels — confirm 0.50 as body equilibrium"
+      - F2b: "FVG selection — confirm confluence priority order"
+      - F4: "MSS quality grade — confirm minimum grade (VALID or STRONG?)"
+      - F8: "FVG mandatory — ruling on optional vs mandatory in chain"
+      - SWEEP_direction_semantics: "Ruling on sweep direction convention + worked example"
+      - ARS_canon_v1_4: "Visual verification of 11 new trades on TradingView"
+      - vLOCK_internal_inconsistencies: "Authorize C1-C4 spec cleanup"
+
+    uncertainties_to_resolve:
+      - U1: "MSSMatch body vs wick — inspect detect.py MSS output (code inspection, no Olya needed)"
+      - U2: "DealingRange equilibrium method — inspect + document (code inspection, no Olya needed)"
+
+    operational_blockers:
+      - SENTINEL_cron: "G to install crontab on M3 terminal"
+
+  total_effort_estimate: |
+    Blocks 0-2: 6-9 days engineering work
+    Block 3 cleanup: 1 day
+    Olya sessions: 2-3 sessions (10 items in her queue)
+    Total: ~10-13 days to full hardening + Olya sessions
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MODEL CONVERGENCE ANALYSIS
+# Where both models independently flagged the same issue = highest confidence
+# ═══════════════════════════════════════════════════════════════════════════════
+
+convergence:
+  both_models_flagged:
+    - SW08: "Governance bypass — OPUS_F5 + OPUS_F14 + CODEX_F10"
+    - SW11: "Config partially loaded — OPUS_F6 + CODEX_F5"
+    - SW15: "Enum string containment — OPUS_F13 + CODEX_F3"
+    - SW21: "Test gaps — multiple overlapping findings"
+  note: |
+    When two different models with different analytical lenses independently
+    identify the same issue, confidence is very high. SW08 (governance bypass)
+    was the strongest convergence — both models flagged it as a clear invariant
+    violation from completely different perspectives.
+
+  unique_to_opus:
+    - SW01: "PDA mitigation inversion (semantic deep-dive)"
+    - SW03: "Day state never wired (methodology enforcement)"
+    - SW10: "PDA timeframe filter (invariant enforcement)"
+    - SW13: "Max chain bars (config enforcement)"
+    - SW16: "ARS entry cap (spec precision)"
+    - SW17: "ARS YAML schema (loader compatibility)"
+    - SW22: "OTE body/wick (spec cross-reference)"
+
+  unique_to_codex:
+    - SW02: "Replay future leak (temporal integrity)"
+    - SW04: "PDA direction/zone corruption (state corruption)"
+    - SW05: "River burst bar drop (live system failure)"
+    - SW06: "Map persistence terminal PDA loss (state corruption)"
+    - SW07: "Chain timezone stripping (edge case)"
+    - SW09: "ARS restart state loss (production readiness)"
+    - SW12: "Non-atomic persistence write (race condition)"
+    - SW14: "River staging silent drop (silent failure)"
+    - SW18: "Sentinel config paths (config drift)"
+    - SW19: "Sentinel Sunday blindspot (monitoring gap)"
+    - SW20: "Gemma server hardcoded venv (portability)"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# POST-SWEEP ADDITIONS (findings registered after 2026-04-17 sweep)
+# ═══════════════════════════════════════════════════════════════════════════════
+# These entries extend the SW01-SW22 catalog with findings surfaced during
+# implementation sprints. They are registered here (not in part_a_runtime_critical
+# which is frozen at original sweep scope) so incoming agents see the full
+# finding surface without digging through commit history.
+
+post_sweep_additions:
+
+  - id: SW23_UTC_NY_PARQUET_CALENDAR_BOUNDARY
+    severity: LOW
+    class: latent_temporal
+    found_by: opus
+    affects: Map-gated path replay at KZ window extremes
+    registered: 2026-04-17 (Friday eve handover)
+    sweep_status: OPEN — Block 2 (non-blocking)
+    description: |
+      load_date_range() reads parquet by UTC calendar date, but replay
+      filters by NY date. Not a correctness bug today — bars past NY 20:00
+      fall outside the existing KZ window scopes. Latent hazard if KZ
+      scopes are ever extended.
+    block: 2
+
+  - id: SW24_RA_ENGINE_DETECTION_TZ_PRESERVATION
+    severity: MEDIUM
+    class: source_of_truth_leak
+    found_by: opus (via codex SW07 follow-up)
+    affects: ra_engine source → chain boundary tz fidelity
+    registered: 2026-04-17 (eve handover, as SW07 follow-up candidate)
+    sweep_status: CONFIRMED_SHIPPED
+    closed: 2026-04-19 (evening)
+    commit_chain:
+      T1: b984f29  # fix(SW24): ra_engine Detection.time tz-aware contract + source emission (T1)
+      T2: f7f0a64  # test(SW24): Detection.time tz-preservation unit suite TG23-TG25 (T2)
+      T3: 9b26ec5  # refactor(SW24): remove SW07 boundary shim + TG26 real-River scenario (T3)
+    description: |
+      ra_engine detectors emitted Detection.time as naive datetimes despite
+      the base.py docstring claiming "NY timezone". The SW07 boundary shim
+      (chain_evaluator.normalize_detection_times) was stamping naive→NY→UTC
+      at map_orchestrator boundary — a masking patch, not a source-of-truth
+      fix. Future ra_engine refactors risked re-opening SW07.
+    resolution: |
+      * Detection.__post_init__ raises ValueError on naive time at construction
+        (INV-DETECTION-TIME-TZ-AWARE).
+      * Every ra_engine detector routes emission through
+        detectors/_common.to_ny_aware() — idempotent on already-aware,
+        UTC-aware preserved as instant.
+      * SW07 boundary shim's naive-stamping branch REMOVED in T3c along with
+        ZoneInfo import, _DEFAULT_ASSUMED_DETECTION_TZ module constant, and
+        assume_tz parameter. Helper retains pd.Timestamp → UTC-aware datetime
+        coercion.
+      * G6 SW02-scope replay determinism (decision_trace + chain_trace)
+        byte-identical pre/post T3c.
+      * TG22 (SW04 T2 detector schema contract, ca639ba) verified unmodified
+        via git log.
+    test_delta: "+29 (13 TG23 + 5 TG24 + 8 TG25 + 3 TG26)"
+    invariants_registered: [INV-DETECTION-TIME-TZ-AWARE]
+    exit_gates: "G1-G7 all PASS"
+
+  - id: SW25_MAP_TIMELINE_NON_DETERMINISM
+    severity: LOW
+    class: non_determinism_hygiene
+    found_by: opus (during SW24 T3d G6 verification)
+    affects: map_timeline.jsonl output (observability layer, not runtime)
+    registered: 2026-04-19 (post-SW24 CTO ratification)
+    sweep_status: OPEN — Block 3 (hygiene)
+    description: |
+      Two consecutive run_map_replay() invocations on identical code +
+      identical input produce different map_timeline.jsonl hashes.
+      Pre-existing, reproduces without SW24 changes against deterministic
+      inputs.
+    correctness_impact_today: NONE
+    rationale: |
+      SW02's determinism invariant hashes only decision_trace +
+      chain_trace; map_timeline is outside that scope. No current
+      consumer asserts determinism on map_timeline.
+    latent_risk: |
+      Future consumers (e.g. Dream Cycle training pipelines, walk-forward
+      audit tooling) may hash map_timeline. If they do before SW25 ships,
+      they see flakes. Registering now means the finding is named, not
+      discovered-again under pressure.
+    block: 3
+    owner: "TBD — future Opus session"
+    prerequisite: |
+      identify the non-determinism source (dict iteration order? concurrent
+      writer ordering? timestamp-at-write?); single-commit fix likely.
+    invariant_if_fixed: INV-MAP-TIMELINE-DETERMINISTIC
+    relationship_to_existing: |
+      Would extend INV-REPLAY-DETERMINISM scope from {decision_trace,
+      chain_trace} to also include {map_timeline}.
+
+  - id: SW01_PDA_MITIGATION_SHIPPED
+    # NOTE: SW01 original entry is in part_a_runtime_critical above (severity CRITICAL,
+    # found_by opus, semantic_drift class). This post-sweep record captures the
+    # SHIPPED status + Monday Olya ruling + commit chain.
+    severity: CRITICAL
+    class: semantic_drift
+    found_by: opus (original sweep 2026-04-17)
+    affects: Map-gated path PDA lifecycle (all FVG-based strategies)
+    registered: 2026-04-17 (original sweep)
+    sweep_status: CONFIRMED_SHIPPED
+    closed: 2026-04-20
+    commit_chain:
+      T1: 55e0d04  # fix(M3.5.1.SW01): swap FVG mitigation semantic to retrace-fill
+    olya_ruling:
+      date: 2026-04-20 (F2F)
+      verdict: "YES SWAP IT"
+      scope_confirmation: "v1 applies to FVG mitigation specifically; other PDA types (OB, iFVG, Breaker) deferred"
+    description: |
+      PDA FVG mitigation semantic was inverted (bearish mitigated on close <
+      zone_bottom, bullish on close > zone_top) — expansion-through-zone was
+      treated as mitigation. Bullish FVGs over-mitigated immediately on any
+      ordinary bullish expansion through zone_top, starving the gate of
+      active PDAs and blocking the bullish live path entirely.
+    resolution: |
+      * Swap mitigation conditions to retrace-fill semantic: bearish mitigates
+        on close > zone_top (upward retrace fills from below), bullish
+        mitigates on close < zone_bottom (downward retrace fills from above).
+      * Applied in parallel at pda_store.update_on_bar_close AND
+        map_engine._replay_price_forward (parallel reimplementations, no
+        call relationship). Lock-step swap per brief scope discipline; the
+        parallel-site duplication is flagged as a separate consolidation
+        follow-up (Block 3).
+      * Replaced 1 pre-SW01 inverted-behaviour test with 4 explicit cases:
+        A (bearish retrace-fill), B (bearish no-mitigate-on-expansion),
+        C (bullish retrace-fill), D (bullish no-mitigate-on-expansion).
+        Cases C + D exercise paths that were effectively dead under the
+        inverted logic.
+      * Full suite: 722 pass, zero regressions. 6/6 ground truth PASS,
+        302 parametrized advance() parity PASS.
+    test_delta: "+3 net (4 new cases A-D replace 1 pre-SW01 inverted test)"
+    invariants_registered: [INV-PDA-MITIGATION-IS-RETRACE-FILL]
+    exit_gates: "G1-G6 all PASS (T1 scope; T2 hygiene docs separate commit)"
+    bullish_live_path: technically_unlocked
+    follow_up_candidates:
+      PDA_MITIGATION_CONSOLIDATION: |
+        pda_store.update_on_bar_close and map_engine._replay_price_forward
+        carry IDENTICAL mitigation logic via two independent reimplementations.
+        Future consolidation brief should extract a shared helper or have
+        map_engine delegate to pda_store. Block 3 hygiene.
+
+  - id: SW26_HEARTBEAT_BOOLEAN_VS_SUBSTANCE_MISMATCH
+    severity: MEDIUM
+    class: operational_observability
+    found_by: [coo, g, cto]
+    affects: Sentinel monitoring + River observability
+    registered: 2026-04-20 (Monday, surfaced via Sentinel false-positive during P1 verification session)
+    sweep_status: OPEN — Block 2 (pre-live hardening)
+    correctness_impact_today: NONE
+    operational_impact: MEDIUM
+    surfacing_context: |
+      2026-04-20 first post-weekend ARS session (pin 5854ccd, P1
+      verification run). Sentinel fired CRITICAL alert
+      "connected=False, subscribed=False" on River heartbeat at ~05:50
+      local. COO diagnosed in ~5 minutes: river.streamer PID 62753
+      RUNNING, 457 bars received, 0 gaps, 452 consecutive good, last
+      bar seconds ago, state STREAMING. ARS checkpoint writing every
+      minute. Verdict: FALSE POSITIVE. Heartbeat writer booleans went
+      stale while bar flow continued normally. Sentinel read the
+      booleans, not the substance.
+    code_refs:
+      - "river side: heartbeat writer (booleans decoupled from stream substance)"
+      - "en1gma/sentinel/sentinel.py::check_river_heartbeat (reads boolean only)"
+    description: |
+      River writes heartbeat JSON with connected/subscribed boolean flags
+      that can go stale/false while bar flow continues normally. Sentinel's
+      check_river_heartbeat reads the booleans, not the substance
+      (last_bar_time recency). Produces false-positive CRITICAL alerts
+      during healthy streaming sessions.
+    relationship_to_other_findings:
+      SW18: |
+        "Sentinel config paths ignored for river_heartbeat/notification_file"
+        Related surface (both touch sentinel.py river check) but distinct.
+        SW18 = config path reading; SW26 = substance-vs-flag reading.
+        RECOMMENDATION: bundle SW18 + SW26 in one brief.
+      SW14: |
+        "River staging silent drop — no warning on malformed lines"
+        Different class (silent drop vs false alarm) but same subsystem.
+        Bundle candidate for a broader river-reliability sprint.
+    bundling_recommendation: |
+      docs/build_docs/BLOCK_2_RIVER_RELIABILITY_M3_5_3.md (sibling of M3_5_2);
+      bundle with SW18 + SW14 + tier 1 sentinel improvements.
+    proposed_fix_shape: |
+      In sentinel.py check_river_heartbeat: read boolean flags AND
+      last_bar_time; if connected=False BUT last_bar_time < 2 min old →
+      downgrade to WARNING; if connected=False AND last_bar_time > 2 min
+      → CRITICAL (true failure); if booleans True but last_bar_time > 5
+      min → new CRITICAL class "frozen stream".
+    proposed_invariant_for_broader_refactor:
+      INV-SENTINEL-SUBSTANCE-OVER-FLAG: |
+        "Sentinel health checks verify SUBSTANCE (data flow, state
+        progression, last-action-timestamp) not FLAGS (boolean
+        declarations by upstream writers). Flags are corroborating
+        signals, not authoritative."
+    requires_olya_input: false
+    block: 2
+    owner: "TBD — Block 2 M3_5_3 bundle"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BOTTOM LINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+bottom_line: |
+  22 new findings (+ 2 confirming existing ledger items). 3 CRITICAL, 6 HIGH.
+
+  The three CRITICAL findings (SW01 mitigation inversion, SW02 replay future leak,
+  SW03 day state unwired) each independently undermine the Map-gated path's correctness.
+  SW02 specifically invalidates any walk-forward validation done through map_replay.
+
+  For PRODUCTION ARS: SW05 (burst bar drop) and SW09 (restart state loss) are the
+  most concerning — both are silent failures that make the daemon appear healthy
+  while missing trades.
+
+  The governance bypass (SW08) was flagged by BOTH models independently — highest
+  confidence finding. Every trade path currently circumvents lease and risk checks,
+  violating INV-NO-UNGOVERNED-TRADES.
+
+  No existing bug ledger items were contradicted or downgraded. All 8 open items
+  from the prior ledger remain valid. The Olya review queue from the prior ledger
+  (9 items) should be scheduled alongside the new Block 0 fixes.
+
+  Estimated total effort: 6-9 days for Blocks 0-2 + Olya calibration sessions.

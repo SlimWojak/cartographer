@@ -1,0 +1,15 @@
+[project]
+name = "cartographer"
+version = "0.0.1"
+description = "HTF candidate-scene mining for Olya review. Lab fork — candidate-only, no methodology truth."
+requires-python = ">=3.12"
+# Dependencies are intentionally empty in the scaffold.
+# The DROID build mission picks the dependency set and pins versions.
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["cartographer*"]

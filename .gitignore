@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# DuckDB
+# The snapshot is gitignored — regenerate via scripts/seed_data.py.
+data/cartographer.duckdb
+*.duckdb.wal
+*.duckdb-journal
+
+# en1gma reference snapshot — gitignored, regenerated via scripts/seed_en1gma_ref.sh.
+# (Pinned SHA lives in docs/source_methodology/PROVENANCE.md.)
+en1gma-ref/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Local-only (not committed)
+.local/
+secrets/
+*.env
